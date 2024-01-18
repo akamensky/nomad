@@ -38,6 +38,9 @@ var (
 	// The name of the directory that is shared across tasks in a task group.
 	SharedAllocName = "alloc"
 
+	// The name of the secret directory that is placed in the shared alloc dir
+	SharedAllocSecretsName = "secrets"
+
 	// Name of the directory where logs of Tasks are written
 	LogDirName = "logs"
 
@@ -50,6 +53,8 @@ var (
 	TmpDirName = "tmp"
 
 	// The set of directories that exist inside each shared alloc directory.
+	// Note, this list does not include the alloc secrets directory because
+	// it is a child of the SharedDataDir.
 	SharedAllocDirs = []string{LogDirName, TmpDirName, SharedDataDir}
 
 	// The name of the directory that exists inside each task directory
@@ -103,6 +108,10 @@ type AllocDir struct {
 	// group.
 	SharedDir string
 
+	// SecretsDir is the name of the allocation's shared secret directory
+	// and is a child of SharedDir.
+	SecretsDir string
+
 	// TaskDirs is a mapping of task names to their non-shared directory.
 	TaskDirs map[string]*TaskDir
 
@@ -148,11 +157,13 @@ func NewAllocDir(logger hclog.Logger, clientAllocDir, allocID string) *AllocDir 
 	logger = logger.Named("alloc_dir")
 	allocDir := filepath.Join(clientAllocDir, allocID)
 	shareDir := filepath.Join(allocDir, SharedAllocName)
+	secretsDir := filepath.Join(shareDir, SharedAllocSecretsName)
 
 	return &AllocDir{
 		clientAllocDir: clientAllocDir,
 		AllocDir:       allocDir,
 		SharedDir:      shareDir,
+		SecretsDir:     secretsDir,
 		TaskDirs:       make(map[string]*TaskDir),
 		logger:         logger,
 	}
@@ -355,6 +366,12 @@ func (d *AllocDir) UnmountAll() error {
 		}
 	}
 
+	if pathExists(d.SecretsDir) {
+		if err := removeSecretDir(d.SecretsDir); err != nil {
+			mErr.Errors = append(mErr.Errors,
+				fmt.Errorf("failed to remove the alloc secret dir %q: %v", d.SecretsDir, err))
+		}
+	}
 	return mErr.ErrorOrNil()
 }
 
@@ -372,6 +389,16 @@ func (d *AllocDir) Build() error {
 
 	// Make the shared directory have non-root permissions.
 	if err := dropDirPermissions(d.SharedDir, os.ModePerm); err != nil {
+		return err
+	}
+
+	// Make the shared directory and make it available to all user/groups.
+	if err := createSecretDir(d.SecretsDir); err != nil {
+		return err
+	}
+
+	// Make the shared directory have non-root permissions.
+	if err := dropDirPermissions(d.SecretsDir, os.ModePerm); err != nil {
 		return err
 	}
 

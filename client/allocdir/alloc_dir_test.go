@@ -67,6 +67,16 @@ func TestAllocDir_BuildAlloc(t *testing.T) {
 		t.Fatalf("Build() didn't create AllocDir %v", d.AllocDir)
 	}
 
+	// Check that the alloc's SharedDir exists.
+	if _, err := os.Stat(d.SharedDir); os.IsNotExist(err) {
+		t.Fatalf("Build() didn't create alloc SharedDir %v", d.SharedDir)
+	}
+
+	// Check that the alloc's SecretsDir exists.
+	if _, err := os.Stat(d.SecretsDir); os.IsNotExist(err) {
+		t.Fatalf("Build() didn't create alloc SecretsDir %v", d.SecretsDir)
+	}
+
 	for _, task := range []*structs.Task{t1, t2} {
 		tDir, ok := d.TaskDirs[task.Name]
 		if !ok {
@@ -137,6 +147,50 @@ func TestAllocDir_MountSharedAlloc(t *testing.T) {
 
 		if !bytes.Equal(act, contents) {
 			t.Errorf("Incorrect data read from task dir: want %v; got %v", contents, act)
+		}
+	}
+}
+
+func TestAllocDir_MountSharedAllocSecrets(t *testing.T) {
+	ci.Parallel(t)
+	MountCompatible(t)
+
+	tmp := t.TempDir()
+
+	d := NewAllocDir(testlog.HCLogger(t), tmp, "test")
+	defer d.Destroy()
+	if err := d.Build(); err != nil {
+		t.Fatalf("Build() failed: %v", err)
+	}
+
+	// Build 2 task dirs
+	td1 := d.NewTaskDir(t1.Name)
+	if err := td1.Build(true, nil); err != nil {
+		t.Fatalf("error build task=%q dir: %v", t1.Name, err)
+	}
+	td2 := d.NewTaskDir(t2.Name)
+	if err := td2.Build(true, nil); err != nil {
+		t.Fatalf("error build task=%q dir: %v", t2.Name, err)
+	}
+
+	// Write a file to the shared dir.
+	contents := []byte("foo")
+	const filename = "bar"
+	if err := os.WriteFile(filepath.Join(d.SecretsDir, filename), contents, 0666); err != nil {
+		t.Fatalf("Couldn't write file to alloc secrets directory: %v", err)
+	}
+
+	// Check that the file exists in the task directories
+	for _, td := range []*TaskDir{td1, td2} {
+		taskFile := filepath.Join(td.SharedTaskDir, filename)
+		act, err := os.ReadFile(taskFile)
+		if err != nil {
+			t.Errorf("Failed to read shared alloc secret file in task dir: %v", err)
+			continue
+		}
+
+		if !bytes.Equal(act, contents) {
+			t.Errorf("Incorrect data read from alloc secret file in task dir: want %v; got %v", contents, act)
 		}
 	}
 }
