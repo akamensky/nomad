@@ -110,11 +110,11 @@ func MountCompatible(t *testing.T) {
 func TestAllocDir_MountSharedAlloc(t *testing.T) {
 	ci.Parallel(t)
 	MountCompatible(t)
-
 	tmp := t.TempDir()
 
 	d := NewAllocDir(testlog.HCLogger(t), tmp, "test")
 	defer d.Destroy()
+
 	if err := d.Build(); err != nil {
 		t.Fatalf("Build() failed: %v", err)
 	}
@@ -158,7 +158,10 @@ func TestAllocDir_MountSharedAllocSecrets(t *testing.T) {
 	tmp := t.TempDir()
 
 	d := NewAllocDir(testlog.HCLogger(t), tmp, "test")
-	defer d.Destroy()
+	defer func() {
+		d.Destroy()
+	}()
+
 	if err := d.Build(); err != nil {
 		t.Fatalf("Build() failed: %v", err)
 	}
@@ -182,7 +185,7 @@ func TestAllocDir_MountSharedAllocSecrets(t *testing.T) {
 
 	// Check that the file exists in the task directories
 	for _, td := range []*TaskDir{td1, td2} {
-		taskFile := filepath.Join(td.SharedTaskDir, filename)
+		taskFile := filepath.Join(td.SharedTaskSecretsDir, filename)
 		act, err := os.ReadFile(taskFile)
 		if err != nil {
 			t.Errorf("Failed to read shared alloc secret file in task dir: %v", err)

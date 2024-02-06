@@ -8,6 +8,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"io/fs"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -70,7 +71,7 @@ var (
 	TaskPrivate = "private"
 
 	// TaskDirs is the set of directories created in each tasks directory.
-	TaskDirs = map[string]os.FileMode{TmpDirName: os.ModeSticky | 0777}
+	TaskDirs = map[string]os.FileMode{TmpDirName: os.ModeSticky | fs.ModePerm}
 
 	// AllocGRPCSocket is the path relative to the task dir root for the
 	// unix socket connected to Consul's gRPC endpoint.
@@ -295,7 +296,7 @@ func (d *AllocDir) Move(other Interface, tasks []*structs.Task) error {
 		if fileInfo != nil && err == nil {
 			// TaskDirs haven't been built yet, so create it
 			newTaskDir := filepath.Join(d.AllocDir, task.Name)
-			if err := os.MkdirAll(newTaskDir, 0777); err != nil {
+			if err := os.MkdirAll(newTaskDir, fs.ModePerm); err != nil {
 				return fmt.Errorf("error creating task %q dir: %v", task.Name, err)
 			}
 			localDir := filepath.Join(newTaskDir, TaskLocal)
@@ -311,42 +312,108 @@ func (d *AllocDir) Move(other Interface, tasks []*structs.Task) error {
 
 // Destroy tears down previously build directory structure.
 func (d *AllocDir) Destroy() error {
+	dl := d.logger.Named("Destroy()")
+	dl.Trace("Destroying AllocDir", "path", d.AllocDir)
+
 	// Unmount all mounted shared alloc dirs.
+	dl.Trace("  calling d.UnmountAll")
 	var mErr multierror.Error
 	if err := d.UnmountAll(); err != nil {
+		dl.Trace("  error from d.UnmountAll()", "err", err)
 		mErr.Errors = append(mErr.Errors, err)
 	}
 
+	dl.Trace("  calling os.RemoveAll", "dir", d.AllocDir)
 	if err := os.RemoveAll(d.AllocDir); err != nil {
+		dl.Trace("  error from os.RemoveAll", "dir", d.AllocDir, "err", err)
 		mErr.Errors = append(mErr.Errors, fmt.Errorf("failed to remove alloc dir %q: %v", d.AllocDir, err))
 	}
 
-	// Unset built since the alloc dir has been destroyed.
+	// Unset built since the task dir has been destroyed.
 	d.mu.Lock()
 	d.built = false
 	d.mu.Unlock()
+	dl.Trace("function completed", "path", d.AllocDir, "mErr", mErr)
 	return mErr.ErrorOrNil()
+}
+
+func (d *AllocDir) logRemoveAll(path string) error {
+	rl := d.logger.Named("Destroy()")
+	rl.Trace("    calling os.RemoveAll", "path", path)
+	err := os.RemoveAll(path)
+	if err != nil {
+		rl.Trace("    error from os.RemoveAll", "error", err)
+	}
+	return err
+}
+
+func unlinkTaskDir(l hclog.Logger, name, dir string, leader string) error {
+	l.Trace(leader+"unlinking", "dir", dir)
+	if pathExists(dir) {
+
+		l.Trace(leader+"  calling unlinkDir", "dir", dir)
+		if err := unlinkDir(dir); err != nil {
+			l.Trace(leader+"  error from unlinkDir", "err", err)
+			return fmt.Errorf("failed to unmount shared alloc dir %q: %v", dir, err)
+		}
+
+		l.Trace(leader+"  calling os.RemoveAll", "dir", dir)
+		if err := os.RemoveAll(dir); err != nil {
+			l.Trace(leader+"  error from unlinkDir", "err", err)
+			return fmt.Errorf("failed to delete shared alloc dir %q: %v", dir, err)
+		}
+	} else {
+		l.Trace(leader+"  dir not found; implied success", "dir", dir)
+	}
+	l.Trace(leader+"unlinked", "dir", dir)
+	return nil
 }
 
 // UnmountAll linked/mounted directories in task dirs.
 func (d *AllocDir) UnmountAll() error {
 	d.mu.RLock()
 	defer d.mu.RUnlock()
-
+	ul := d.logger.Named("Destroy()")
 	var mErr multierror.Error
-	for _, dir := range d.TaskDirs {
+
+	for t, dir := range d.TaskDirs {
+		if !dir.IsBuilt() && !pathExists(dir.Dir) {
+			ul.Trace("  skipping unbuilt and missing TaskDir", "path", dir.Dir)
+			continue
+		}
+
+		dir := dir
+		tl := ul.With("task", t)
+		if !dir.IsBuilt() {
+			ul.Trace("  ***TaskDir with IsBuilt==false", "path", dir.Dir)
+		}
+		tl.Trace("  unlinking TaskDir", dir.AsLogKeyValues(true)...)
+
+		// Check to see if the shared secrets dir is mounted.
+		if pathExists(dir.SharedTaskSecretsDir) {
+			tl.Trace("  found a SharedTaskSecretsDir", "path", dir.SharedTaskSecretsDir)
+			tl.Trace("    calling removeSecretDir", "dir", dir.SharedTaskSecretsDir)
+			if err := removeSecretDir(dir.SharedTaskSecretsDir); err != nil {
+				tl.Trace("    error from removeSecretDir", "dir", dir.SharedTaskSecretsDir, "err", err)
+			}
+		}
+
 		// Check if the directory has the shared alloc mounted.
 		if pathExists(dir.SharedTaskDir) {
+			tl.Trace("  found a SharedTaskDir", "path", dir.SharedTaskDir)
+			tl.Trace("    calling remove", "path", dir.SharedTaskDir)
 			if err := unlinkDir(dir.SharedTaskDir); err != nil {
 				mErr.Errors = append(mErr.Errors,
 					fmt.Errorf("failed to unmount shared alloc dir %q: %v", dir.SharedTaskDir, err))
-			} else if err := os.RemoveAll(dir.SharedTaskDir); err != nil {
+			} else if err := d.logRemoveAll(dir.SharedTaskDir); err != nil {
 				mErr.Errors = append(mErr.Errors,
 					fmt.Errorf("failed to delete shared alloc dir %q: %v", dir.SharedTaskDir, err))
 			}
 		}
 
 		if pathExists(dir.SecretsDir) {
+			tl.Trace("found a SecretsDir", "path", dir.SecretsDir)
+			tl.Trace("calling removeSecretDir", "path", dir.SecretsDir)
 			if err := removeSecretDir(dir.SecretsDir); err != nil {
 				mErr.Errors = append(mErr.Errors,
 					fmt.Errorf("failed to remove the secret dir %q: %v", dir.SecretsDir, err))
@@ -354,6 +421,8 @@ func (d *AllocDir) UnmountAll() error {
 		}
 
 		if pathExists(dir.PrivateDir) {
+			tl.Trace("found a SecretsDir", "path", dir.SecretsDir)
+			tl.Trace("calling removeSecretDir", "path", dir.SecretsDir)
 			if err := removeSecretDir(dir.PrivateDir); err != nil {
 				mErr.Errors = append(mErr.Errors,
 					fmt.Errorf("failed to remove the private dir %q: %v", dir.PrivateDir, err))
@@ -365,58 +434,83 @@ func (d *AllocDir) UnmountAll() error {
 			mErr.Errors = append(mErr.Errors, err)
 		}
 	}
-
 	if pathExists(d.SecretsDir) {
+		ul.Trace("found alloc secrets dir")
+		ul.Trace("calling removeSecretDir", "dir", d.SecretsDir)
 		if err := removeSecretDir(d.SecretsDir); err != nil {
+			ul.Trace("error from removeSecretDir", "dir", d.SecretsDir, "err", err)
 			mErr.Errors = append(mErr.Errors,
 				fmt.Errorf("failed to remove the alloc secret dir %q: %v", d.SecretsDir, err))
 		}
 	}
 	return mErr.ErrorOrNil()
 }
+func makeAllocSubfolder(l hclog.Logger, name, path string, perms fs.FileMode, leader string) error {
+	l.Trace(leader+"creating "+name, "path", path)
+	l.Trace(leader+"  calling os.MkdirAll       ", "path", path, "perms", perms)
+	if err := os.MkdirAll(path, perms); err != nil {
+		l.Trace(leader+"  error from os.MkdirAll", "path", path, "perms", perms, "err", err)
+		return fmt.Errorf("error creating path: %w", err)
+	}
+	l.Trace(leader+"  calling dropDirPermissions", "path", path, "perms", perms)
+	if err := dropDirPermissions(path, perms); err != nil {
+		l.Trace(leader+"  error from dropDirPermissions", "path", path, "desired", perms, "err", err)
+		return fmt.Errorf("error dropping permissions: %w", err)
+	}
+	l.Trace(leader+"created "+name, "path", path)
+	return nil
+}
+func makeSecretsSubfolder(l hclog.Logger, name, path string, perms fs.FileMode, leader string) error {
+	l.Trace(leader+"creating "+name, "path", path)
+	l.Trace(leader+"  calling createSecretDir   ", "dir", path)
+	if err := createSecretDir(path); err != nil {
+		l.Trace(leader+"  error from createSecretDir", "dir", path, "err", err)
+		return fmt.Errorf("error creating secret dir: %w", err)
+	}
+	l.Trace(leader+"  calling dropDirPermissions", "path", path, "perms", perms)
+	if err := dropDirPermissions(path, perms); err != nil {
+		l.Trace(leader+"  error from dropDirPermissions", "path", path, "desired", perms, "err", err)
+		return fmt.Errorf("error dropping permissions: %w", err)
+	}
+	l.Trace(leader+"created "+name, "path", path)
+	return nil
+}
 
 // Build the directory tree for an allocation.
 func (d *AllocDir) Build() error {
+	bl := d.logger.Named("Build()")
 	// Make the alloc directory, owned by the nomad process.
-	if err := os.MkdirAll(d.AllocDir, 0755); err != nil {
+	bl.Trace("Creating AllocDir", "path", d.AllocDir)
+	if err := os.MkdirAll(d.AllocDir, fs.FileMode(0755)); err != nil {
+		bl.Trace("  error from os.MkdirAll", "path", d.AllocDir, "err", err)
 		return fmt.Errorf("Failed to make the alloc directory %v: %v", d.AllocDir, err)
 	}
 
-	// Make the shared directory and make it available to all user/groups.
-	if err := os.MkdirAll(d.SharedDir, 0777); err != nil {
+	// Make the shared directory and make it available to all user/groups
+	if err := makeAllocSubfolder(bl, "d.SharedDir", d.SharedDir, fs.ModePerm, "  "); err != nil {
 		return err
 	}
 
-	// Make the shared directory have non-root permissions.
-	if err := dropDirPermissions(d.SharedDir, os.ModePerm); err != nil {
-		return err
-	}
-
-	// Make the shared directory and make it available to all user/groups.
-	if err := createSecretDir(d.SecretsDir); err != nil {
-		return err
-	}
-
-	// Make the shared directory have non-root permissions.
-	if err := dropDirPermissions(d.SecretsDir, os.ModePerm); err != nil {
+	// Make the shared directory and make it available to all user/groups
+	if err := makeSecretsSubfolder(bl, "d.SecretsDir", d.SecretsDir, fs.ModePerm, "  "); err != nil {
 		return err
 	}
 
 	// Create shared subdirs
 	for _, dir := range SharedAllocDirs {
 		p := filepath.Join(d.SharedDir, dir)
-		if err := os.MkdirAll(p, 0777); err != nil {
-			return err
-		}
-		if err := dropDirPermissions(p, os.ModePerm); err != nil {
+		// Make the shared directory and make it available to all user/groups
+		if err := makeAllocSubfolder(bl, fmt.Sprintf("SharedAllocDir %q", dir), p, fs.ModePerm, "  "); err != nil {
 			return err
 		}
 	}
 
 	// Mark as built
 	d.mu.Lock()
+	bl.Trace("marking alloc as built")
 	d.built = true
 	d.mu.Unlock()
+	bl.Trace("function completed without errors")
 	return nil
 }
 
@@ -615,6 +709,7 @@ func fileCopy(src, dst string, uid, gid int, perm os.FileMode) error {
 	return nil
 }
 
+// createAllocFolder()
 // pathExists is a helper function to check if the path exists.
 func pathExists(path string) bool {
 	if _, err := os.Stat(path); err != nil {
