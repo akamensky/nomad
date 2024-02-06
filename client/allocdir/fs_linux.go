@@ -28,7 +28,7 @@ func linkDir(src, dst string) error {
 		return err
 	}
 
-	return syscall.Mount(src, dst, "", syscall.MS_BIND, "")
+	return syscall.Mount(src, dst, "", syscall.MS_BIND|syscall.MS_REC, "")
 }
 
 // unlinkDir unmounts a bind mounted directory as Linux doesn't support
@@ -65,19 +65,17 @@ func createSecretDir(dir string) error {
 		}
 
 		// Create the marker file so we don't try to mount more than once
-		f, err := os.OpenFile(marker, os.O_RDWR|os.O_CREATE, 0666)
-		if err != nil {
+		if err := os.WriteFile(marker, []byte{}, 0666); err != nil {
 			// Hard fail since if this fails something is really wrong
 			return err
 		}
-		f.Close()
 		return nil
 	}
 
 	return os.MkdirAll(dir, 0777)
 }
 
-// createSecretDir removes the secrets dir folder
+// removeSecretDir removes the secrets dir folder
 func removeSecretDir(dir string) error {
 	if unix.Geteuid() == 0 {
 		if err := unlinkDir(dir); err != nil {

@@ -22,6 +22,10 @@ var (
 	// directory shared across tasks in a task group.
 	SharedAllocContainerPath = filepath.Join("/", SharedAllocName)
 
+	// SharedAllocContainerPath is the path inside container for mounted
+	// directory shared across tasks in a task group.
+	SharedAllocSecretsContainerPath = filepath.Join("/", SharedAllocName, SharedAllocSecretsName)
+
 	// TaskLocalContainerPath is the path inside a container for mounted directory
 	// for local storage.
 	TaskLocalContainerPath = filepath.Join("/", TaskLocal)
@@ -34,7 +38,7 @@ var (
 // dropDirPermissions gives full access to a directory to all users and sets
 // the owner to nobody.
 func dropDirPermissions(path string, desired os.FileMode) error {
-	if err := os.Chmod(path, desired|0777); err != nil {
+	if err := os.Chmod(path, desired|os.ModePerm); err != nil {
 		return fmt.Errorf("Chmod(%v) failed: %v", path, err)
 	}
 
