@@ -400,8 +400,14 @@ type Builder struct {
 	// secretsDir from task's perspective; eg /secrets
 	secretsDir string
 
+	// secretsDir from task's perspective; eg /alloc/secrets
+	allocSecretsDir string
+
 	// clientSharedAllocDir is the shared alloc dir from the client's perspective; eg, <alloc_dir>/<alloc_id>/alloc
 	clientSharedAllocDir string
+
+	// clientSharedAllocSecretsDir is the shared alloc dir from the client's perspective; eg, <alloc_dir>/<alloc_id>/alloc/secrets
+	clientSharedAllocSecretsDir string
 
 	// clientTaskRoot is the task working directory from the client's perspective; eg <alloc_dir>/<alloc_id>/<task>
 	clientTaskRoot string
@@ -872,6 +878,13 @@ func (b *Builder) SetTaskLocalDir(dir string) *Builder {
 func (b *Builder) SetClientSharedAllocDir(dir string) *Builder {
 	b.mu.Lock()
 	b.clientSharedAllocDir = dir
+	b.mu.Unlock()
+	return b
+}
+
+func (b *Builder) SetClientSharedAllocSecretsDir(dir string) *Builder {
+	b.mu.Lock()
+	b.clientSharedAllocSecretsDir = dir
 	b.mu.Unlock()
 	return b
 }
