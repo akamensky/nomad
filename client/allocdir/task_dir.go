@@ -4,9 +4,13 @@
 package allocdir
 
 import (
+	"encoding/json"
 	"fmt"
+	"io/fs"
 	"os"
 	"path/filepath"
+	"strings"
+	"sync"
 
 	hclog "github.com/hashicorp/go-hclog"
 )
@@ -29,6 +33,15 @@ type TaskDir struct {
 	// <task_dir>/alloc/
 	SharedTaskDir string
 
+	// SharedAllocDir is the path to shared alloc directory on the host
+	// <alloc_dir>/alloc/secrets
+	SharedAllocSecretsDir string
+
+	// SharedTaskDir is the path to the shared alloc secrets directory
+	// linked into the task directory on the host.
+	// <task_dir>/alloc/secrets
+	SharedTaskSecretsDir string
+
 	// LocalDir is the path to the task's local directory on the host
 	// <task_dir>/local/
 	LocalDir string
@@ -49,6 +62,10 @@ type TaskDir struct {
 	// client.alloc_dir recursively.
 	skip map[string]struct{}
 
+	// built is true if Build has successfully run
+	built bool
+
+	mu     sync.RWMutex
 	logger hclog.Logger
 }
 
@@ -65,16 +82,18 @@ func newTaskDir(logger hclog.Logger, clientAllocDir, allocDir, taskName string) 
 	skip := map[string]struct{}{clientAllocDir: {}}
 
 	return &TaskDir{
-		AllocDir:       allocDir,
-		Dir:            taskDir,
-		SharedAllocDir: filepath.Join(allocDir, SharedAllocName),
-		LogDir:         filepath.Join(allocDir, SharedAllocName, LogDirName),
-		SharedTaskDir:  filepath.Join(taskDir, SharedAllocName),
-		LocalDir:       filepath.Join(taskDir, TaskLocal),
-		SecretsDir:     filepath.Join(taskDir, TaskSecrets),
-		PrivateDir:     filepath.Join(taskDir, TaskPrivate),
-		skip:           skip,
-		logger:         logger,
+		AllocDir:              allocDir,
+		Dir:                   taskDir,
+		SharedAllocDir:        filepath.Join(allocDir, SharedAllocName),
+		SharedAllocSecretsDir: filepath.Join(allocDir, SharedAllocName, SharedAllocSecretsName),
+		LogDir:                filepath.Join(allocDir, SharedAllocName, LogDirName),
+		SharedTaskDir:         filepath.Join(taskDir, SharedAllocName),
+		SharedTaskSecretsDir:  filepath.Join(taskDir, SharedAllocName, SharedAllocSecretsName),
+		LocalDir:              filepath.Join(taskDir, TaskLocal),
+		SecretsDir:            filepath.Join(taskDir, TaskSecrets),
+		PrivateDir:            filepath.Join(taskDir, TaskPrivate),
+		skip:                  skip,
+		logger:                logger,
 	}
 }
 
@@ -82,32 +101,22 @@ func newTaskDir(logger hclog.Logger, clientAllocDir, allocDir, taskName string) 
 // allows skipping chroot creation if the caller knows it has already been
 // done. client.alloc_dir will be skipped.
 func (t *TaskDir) Build(createChroot bool, chroot map[string]string) error {
-	if err := os.MkdirAll(t.Dir, 0777); err != nil {
+	bl := t.logger.Named("Build()")
+	bl.Trace("Creating TaskDir ")
+
+	if err := makeAllocSubfolder(bl, "t.Dir", t.Dir, fs.ModePerm, "  "); err != nil {
 		return err
 	}
 
-	// Make the task directory have non-root permissions.
-	if err := dropDirPermissions(t.Dir, os.ModePerm); err != nil {
-		return err
-	}
-
-	// Create a local directory that each task can use.
-	if err := os.MkdirAll(t.LocalDir, 0777); err != nil {
-		return err
-	}
-
-	if err := dropDirPermissions(t.LocalDir, os.ModePerm); err != nil {
+	if err := makeAllocSubfolder(bl, "t.LocalDir", t.LocalDir, fs.ModePerm, "  "); err != nil {
 		return err
 	}
 
 	// Create the directories that should be in every task.
 	for dir, perms := range TaskDirs {
 		absdir := filepath.Join(t.Dir, dir)
-		if err := os.MkdirAll(absdir, perms); err != nil {
-			return err
-		}
-
-		if err := dropDirPermissions(absdir, perms); err != nil {
+		bl.Trace(fmt.Sprintf("  creating TaskDir %q", dir), "path", absdir)
+		if err := makeAllocSubfolder(bl, "t.Dir", absdir, perms, "    "); err != nil {
 			return err
 		}
 	}
@@ -117,41 +126,83 @@ func (t *TaskDir) Build(createChroot bool, chroot map[string]string) error {
 	// If there's no isolation the task will use the host path to the
 	// shared alloc dir.
 	if createChroot {
+		bl.Trace("linking alloc and alloc secrets dir into chroot")
 		// If the path doesn't exist OR it exists and is empty, link it
 		empty, _ := pathEmpty(t.SharedTaskDir)
+		bl.Trace("  should link alloc dir test", "value", !pathExists(t.SharedTaskDir) || empty, "pathExists(t.SharedTaskDir)", pathExists(t.SharedTaskDir), "empty", empty)
 		if !pathExists(t.SharedTaskDir) || empty {
+			bl.Trace("  linking alloc dir into chroot")
+			bl.Trace("    calling linkDir", "src", t.SharedAllocDir, "dst", t.SharedTaskDir)
 			if err := linkDir(t.SharedAllocDir, t.SharedTaskDir); err != nil {
+				bl.Trace("    error from linkDir", "src", t.SharedAllocDir, "dst", t.SharedTaskDir, "err", err)
 				return fmt.Errorf("Failed to mount shared directory for task: %v", err)
 			}
 		}
+		// // If the path doesn't exist OR it exists and is empty, link it
+		// empty, _ = pathEmpty(t.SharedTaskSecretsDir)
+		// bl.Trace("  should link alloc dir test", "value", !pathExists(t.SharedTaskSecretsDir) || empty, "pathExists(t.SharedTaskSecretsDir)", pathExists(t.SharedTaskSecretsDir), "empty", empty)
+		// if !pathExists(t.SharedTaskSecretsDir) || empty {
+		// 	bl.Trace("  linking alloc secrets dir into chroot")
+		// 	bl.Trace("    calling linkDir", "src", t.SharedAllocSecretsDir, "dst", t.SharedTaskSecretsDir)
+		// 	if err := linkDir(t.SharedAllocSecretsDir, t.SharedTaskSecretsDir); err != nil {
+		// 		bl.Trace("    error from linkDir", "src", t.SharedAllocSecretsDir, "dst", t.SharedTaskSecretsDir, "err", err)
+		// 		return fmt.Errorf("failed to mount shared secrets directory for task: %w", err)
+		// 	}
+		// }
 	}
 
 	// Create the secret directory
+	bl.Trace("creating task secret directory")
+	bl.Trace("  calling createSecretDir", "dir", t.SecretsDir)
 	if err := createSecretDir(t.SecretsDir); err != nil {
+		bl.Trace("  error from createSecretDir", "dir", t.SecretsDir, "err", err)
 		return err
 	}
 
+	bl.Trace("  calling dropDirPermissions", "dir", t.SecretsDir, "desired", os.ModePerm)
 	if err := dropDirPermissions(t.SecretsDir, os.ModePerm); err != nil {
+		bl.Trace("   from dropDirPermissions", "dir", t.SecretsDir, "desired", os.ModePerm, "err", err)
 		return err
 	}
 
 	// Create the private directory
+	bl.Trace("creating task private directory")
+	bl.Trace("  calling createSecretDir", "dir", t.PrivateDir)
 	if err := createSecretDir(t.PrivateDir); err != nil {
+		bl.Trace("  error from createSecretDir", "dir", t.PrivateDir, "err", err)
 		return err
 	}
 
+	bl.Trace("  calling dropDirPermissions", "dir", t.PrivateDir, "desired", os.ModePerm)
 	if err := dropDirPermissions(t.PrivateDir, os.ModePerm); err != nil {
+		bl.Trace("  error from dropDirPermissions", "dir", t.PrivateDir, "desired", os.ModePerm, "err", err)
 		return err
 	}
 
 	// Build chroot if chroot filesystem isolation is going to be used
 	if createChroot {
+		bl.Trace("calling t.buildChroot", "chroot", chroot)
 		if err := t.buildChroot(chroot); err != nil {
+			bl.Trace("error from t.buildChroot", "chroot", chroot, "err", err)
 			return err
 		}
 	}
 
+	// Mark as built
+	t.mu.Lock()
+	bl.Trace("marking task_dir as built")
+	t.built = true
+	t.mu.Unlock()
+	bl.Trace("function completed without errors")
 	return nil
+}
+
+// IsBuilt returns whether or not the Build() function has been called and
+// completed successfully.
+func (t *TaskDir) IsBuilt() bool {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+	return t.built
 }
 
 // buildChroot takes a mapping of absolute directory or file paths on the host
@@ -256,4 +307,38 @@ func (t *TaskDir) embedDirs(entries map[string]string) error {
 	}
 
 	return nil
+}
+
+func (t *TaskDir) AsJSON() (string, error) {
+	b, err := json.Marshal(t)
+	return string(b), err
+}
+
+func (t *TaskDir) MustAsJSON() string {
+	b, err := json.Marshal(t)
+	if err == nil {
+		return string(b)
+	}
+	panic(err)
+}
+
+func (t *TaskDir) AsLogKeyValues(relative bool) []any {
+	p := func(s string) string { return s }
+	if relative {
+		p = func(s string) string { return "«AllocDir»" + strings.TrimPrefix(s, t.AllocDir) }
+	}
+	out := []any{
+		"AllocDir", t.AllocDir,
+		"Dir", p(t.Dir),
+		"SharedAllocDir", p(t.SharedAllocDir),
+		"SharedTaskDir", p(t.SharedTaskDir),
+		"SharedAllocSecretsDir", p(t.SharedAllocSecretsDir),
+		"SharedTaskSecretsDir", p(t.SharedTaskSecretsDir),
+		"LocalDir", p(t.LocalDir),
+		"LogDir", p(t.LogDir),
+		"SecretsDir", p(t.SecretsDir),
+		"PrivateDir", p(t.PrivateDir),
+	}
+	return out
+
 }
