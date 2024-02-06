@@ -868,6 +868,13 @@ func (b *Builder) SetAllocDir(dir string) *Builder {
 	return b
 }
 
+func (b *Builder) SetAllocSecretsDir(dir string) *Builder {
+	b.mu.Lock()
+	b.allocSecretsDir = dir
+	b.mu.Unlock()
+	return b
+}
+
 func (b *Builder) SetTaskLocalDir(dir string) *Builder {
 	b.mu.Lock()
 	b.localDir = dir
