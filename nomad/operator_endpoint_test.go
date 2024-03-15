@@ -14,6 +14,7 @@ import (
 	"path"
 	"reflect"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -378,10 +379,11 @@ func TestOperator_RaftRemovePeerByID_ACL(t *testing.T) {
 
 type testcluster struct {
 	t       *testing.T
+	args    tcArgs
 	server  []*Server
 	cleanup []func()
 	token   *structs.ACLToken
-	rpc     func(string, any, any) error
+	rpcs    []func(string, any, any) error
 }
 
 func (tc testcluster) Cleanup() {
@@ -406,7 +408,9 @@ func newTestCluster(t *testing.T, args tcArgs) (tc testcluster) {
 	cSize := args.size
 	out := testcluster{
 		t:       t,
+		args:    args,
 		server:  make([]*Server, cSize),
+		rpcs:    make([]func(string, any, any) error, cSize),
 		cleanup: make([]func(), cSize),
 	}
 
@@ -417,9 +421,9 @@ func newTestCluster(t *testing.T, args tcArgs) (tc testcluster) {
 			c.BootstrapExpect = cSize
 			c.ACLEnabled = args.enableACL
 		})
+		out.rpcs[i] = out.server[i].RPC
 	}
 	t.Cleanup(out.Cleanup)
-	out.rpc = out.server[0].RPC
 
 	TestJoin(t, out.server...)
 	out.WaitForLeader()
@@ -437,8 +441,23 @@ func newTestCluster(t *testing.T, args tcArgs) (tc testcluster) {
 	return out
 }
 
+// WaitForLeader performs a parallel WaitForLeader over each cluster member,
+// because testutil doesn't export rpcFn so we can't create a collection of
+// rpcFn to use testutil.WaitForLeaders directly.
 func (tc testcluster) WaitForLeader() {
-	testutil.WaitForLeader(tc.t, tc.rpc)
+	var wg sync.WaitGroup
+	for i := 0; i < len(tc.rpcs); i++ {
+		idx := i
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+
+			// The WaitForLeader func uses WaitForResultRetries
+			// so this should timeout at 5 seconds * test multiplier
+			testutil.WaitForLeader(tc.t, tc.rpcs[idx])
+		}()
+	}
+	wg.Wait()
 }
 
 func (tc testcluster) leader() *Server {
@@ -451,26 +470,13 @@ func (tc testcluster) leader() *Server {
 	return nil
 }
 
-func (tc testcluster) anyFollower() *Server {
-	if len(tc.server) < 2 {
-		return nil
-	}
-
-	testutil.WaitForLeader(tc.t, tc.rpc)
-	for _, s := range tc.server {
-		if isLeader, _ := s.getLeader(); !isLeader {
-			return s
-		}
-	}
-	// something weird happened.
-	return nil
-}
-
 func TestOperator_TransferLeadershipToServerAddress_ACL(t *testing.T) {
 	ci.Parallel(t)
 
 	tc := newTestCluster(t, tcArgs{enableACL: true})
 	s1 := tc.leader()
+	must.NotNil(t, s1)
+
 	codec := rpcClient(t, s1)
 	state := s1.fsm.State()
 
@@ -527,6 +533,8 @@ func TestOperator_TransferLeadershipToServerID_ACL(t *testing.T) {
 	ci.Parallel(t)
 	tc := newTestCluster(t, tcArgs{enableACL: true})
 	s1 := tc.leader()
+	must.NotNil(t, s1)
+
 	codec := rpcClient(t, s1)
 	state := s1.fsm.State()
 
